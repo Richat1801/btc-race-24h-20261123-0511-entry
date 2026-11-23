@@ -1,118 +1,139 @@
-// Dip-Buy cbBTC Bot — btc-race-24h-20261123-0511
+// Dip-buy bot for cbBTC (CBBTC) on the make.fun bars-replay protocol.
 //
-// Strategy: buy the whole $1,000 (paper) only on a confirmed V-dip, then exit
-// on a hard stop or a tight trailing stop. One position at a time, long only,
-// fully deterministic (no clock, no randomness, no network).
+// Idea in one line: only buy a dip that has already stopped falling, then
+// get out on a hard stop or a trailing stop, and stop trading after the
+// first profitable trailing exit.
 //
-// Entry (all must hold, after a 240-bar warm-up):
-//   - close at least 0.6% below its 240-bar simple moving average, and
-//   - close at least 0.4% below the close 60 minutes ago (a real drop, not noise), and
-//   - close at or above the highest close of the last 3 bars (the V-confirm:
-//     the fall has stopped and the price is turning back up).
-// After any exit the bot waits 240 bars AND for the price to trade back above
-// its 240-bar average before it may buy again, so it cannot re-buy into the
-// same slide it just stopped out of.
+// The bot is fully deterministic: it reads nothing but the bars the harness
+// sends it, keeps all of its state in memory, and does every comparison in
+// exact bigint arithmetic (prices are integers, so a "0.6% below" test is a
+// cross-multiplication, never a float).
 //
-// Exit:
-//   - hard stop: close 1.0% below the entry price, or
-//   - trailing stop: once the close has peaked at least 0.5% above entry,
-//     a close 0.8% below that peak locks the gain in.
-// A profitable trailing exit ends trading for the window: the dev window this
-// was fitted on is nearly flat with a ~26 bps round-trip cost, so every
-// extra trade is a coin flip that pays the spread. One good dip is enough.
-//
-// Why this shape: on the frozen 24 h dev window (+3.64% start to end, 1-min
-// sd 8.1 bps, lag-1 autocorr +0.12) every fast/trend strategy loses to the
-// round-trip cost in simulation (EMA-cross about -$106 on the previous
-// edition's window). Only near-buy-and-hold and selective dip-buying clear
-// the dev gate. This bot's Python-simulated dev result is about +$9.0 on
-// 2 trades with max drawdown under 1%, and it stays positive on the
-// time-reversed window (+$1.1), where buy-and-hold loses -$35.
-//
-// Slippage is left wide open (10,000 bps) like the house baselines: the fill
-// is modelled at the next open with fee + slippage + pool impact, and a
-// narrow cap would only add rejected orders.
+// Rules, in bar order:
+//   * Warm up for 240 bars before the first buy can fire.
+//   * Buy (full cash, one position at a time) when all three hold:
+//       - the close sits at least 0.6% below its 240-bar average,
+//       - the close sits at least 0.4% below the close 60 bars ago, and
+//       - the close is the highest close of the last 3 bars, i.e. the
+//         fall has stopped and the price has just turned back up.
+//   * Sell everything when either exit fires:
+//       - hard stop: the close drops 1.0% below the entry close, or
+//       - trailing stop: once the close has peaked at least 0.5% above
+//         the entry close, sell when it falls 0.8% below that peak.
+//   * After any exit, wait 240 bars and require the close to trade back
+//     above its 240-bar average before the next buy may fire.
+//   * A trailing exit that sells above the entry close ends trading for
+//     the rest of the window.
 
-import { runBars, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState } from './vendor/makefun-bars.ts';
+import type { Batch } from './vendor/makefun-bars.ts';
+import type { OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const MAX_SLIPPAGE_BPS = 10_000;
+const WARMUP_BARS = 240;
+const LOOKBACK_BARS = 60;
+const COOLDOWN_BARS = 240;
+const MAX_SLIPPAGE_BPS = 10000;
 
-// Entry thresholds.
-const WARMUP_BARS = 240; // bars of history before the first buy is allowed
-const SMA_BARS = 240; // long average the dip is measured against
-const DIP_BPS = 60; // close must sit >= 0.6% below the 240-bar average
-const DROP60_BPS = 40; // close must sit >= 0.4% below the close 60 bars ago
-const CONFIRM_BARS = 3; // V-confirm: close >= max close of the last 3 bars
+// Thresholds, kept as integer ratios so every test below is exact:
+//   0.6% below the average  -> close * 1000 <= avg * 994
+//   0.4% below 60 bars ago  -> close * 1000 <= then * 996
+//   1.0% hard stop          -> close * 100  <= entry * 99
+//   0.5% peak for trailing   -> peak * 200   >= entry * 201
+//   0.8% fall off the peak   -> close * 1000 <= peak * 992
+const DIP_BPS = 994n;
+const MOMENTUM_BPS = 996n;
+const STOP_BPS = 99n;
+const PEAK_BPS_NUM = 201n;
+const TRAIL_BPS = 992n;
 
-// Exit thresholds.
-const HARD_STOP_BPS = 100; // sell 1.0% below entry
-const TRAIL_ARM_BPS = 50; // trailing stop arms once peak is 0.5% above entry
-const TRAIL_BPS = 80; // then sell 0.8% below the peak
+const closes: bigint[] = [];
+let entryClose: bigint | null = null;
+let peakClose: bigint | null = null;
+let awaitingFill = false;
+let done = false;
+let barsSinceExit: number | null = null;
 
-const COOLDOWN_BARS = 240; // bars to wait after an exit before re-arming
-
-const closes: number[] = []; // closes in bar order, price_scale units
-let entryClose = 0; // close at the bar the buy was decided on
-let peakClose = 0; // highest close seen while holding
-let cooldownUntil = -1; // bar index before which no new buy
-let rearmed = true; // after an exit, price must trade back above the SMA
-let done = false; // set after a profitable trailing exit: stop trading
-
-function sma240(): number {
-  let sum = 0;
-  for (let i = closes.length - SMA_BARS; i < closes.length; i++) sum += closes[i];
-  return sum / SMA_BARS;
+function sma240(): bigint {
+  let sum = 0n;
+  for (let i = closes.length - WARMUP_BARS; i < closes.length; i++) sum += closes[i]!;
+  return sum;
 }
 
-await runBars({
-  onBatch(state) {
-    if (state.warmingUp || done) return [];
-    const close = state.close(SYMBOL);
-    if (close === null) return [];
-    const closeNum = Number(close);
-    closes.push(closeNum);
-    const idx = closes.length - 1;
-    const held = state.positions.get(SYMBOL) ?? null;
-    const orders: Array<BuyInput | SellInput> = [];
+function onBatch(state: BarsState, _batch: Batch): OrderInput[] {
+  if (state.warmingUp) return [];
+  const close = state.close(SYMBOL);
+  if (close === null) return [];
+  closes.push(close);
 
-    if (held !== null) {
-      if (closeNum > peakClose) peakClose = closeNum;
-      const stopPrice = (entryClose * (10_000 - HARD_STOP_BPS)) / 10_000;
-      const armed = peakClose >= (entryClose * (10_000 + TRAIL_ARM_BPS)) / 10_000;
-      const trailPrice = (peakClose * (10_000 - TRAIL_BPS)) / 10_000;
-      if (closeNum <= stopPrice || (armed && closeNum <= trailPrice)) {
-        const trailingWin = armed && closeNum <= trailPrice && closeNum > entryClose;
-        orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        cooldownUntil = idx + COOLDOWN_BARS;
-        rearmed = false;
-        if (trailingWin) done = true;
-      }
-      return orders;
-    }
+  const held = state.positions.get(SYMBOL);
+  const qty = held?.qty ?? 0n;
 
-    // Flat: look for a confirmed V-dip.
-    if (idx < WARMUP_BARS) return [];
-    if (idx < cooldownUntil) return [];
-    if (!rearmed) {
-      if (closeNum >= sma240()) rearmed = true;
-      else return [];
+  // A buy decided on the previous bar fills at this bar's open, so the
+  // position only shows up one batch later. While waiting, do nothing; if
+  // it never appears, the buy was rejected and the entry is abandoned.
+  if (awaitingFill) {
+    if (qty > 0n) {
+      awaitingFill = false;
+    } else {
+      entryClose = null;
+      peakClose = null;
+      awaitingFill = false;
+      return [];
     }
-    const avg = sma240();
-    if (closeNum >= (avg * (10_000 - DIP_BPS)) / 10_000) return [];
-    if (closes[idx - 60] === undefined) return [];
-    if (closeNum >= (closes[idx - 60] * (10_000 - DROP60_BPS)) / 10_000) return [];
-    let recentMax = 0;
-    for (let i = idx - CONFIRM_BARS + 1; i <= idx; i++) {
-      if (closes[i] > recentMax) recentMax = closes[i];
-    }
-    if (closeNum < recentMax) return [];
+  }
 
-    const cash = state.cash;
-    if (cash <= 0n) return [];
-    entryClose = closeNum;
-    peakClose = closeNum;
-    orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: cash, max_slippage_bps: MAX_SLIPPAGE_BPS });
-    return orders;
-  },
-});
+  if (qty > 0n && entryClose !== null) {
+    // In a position: maintain the running peak and check both exits.
+    if (peakClose === null || close > peakClose) peakClose = close;
+    const peak = peakClose;
+
+    const hitStop = close * 100n <= entryClose * STOP_BPS;
+    const peakHighEnough = peak * 200n >= entryClose * PEAK_BPS_NUM;
+    const hitTrail = peakHighEnough && close * 1000n <= peak * TRAIL_BPS;
+
+    if (hitStop || hitTrail) {
+      // A trailing exit above the entry close is a win: stop for the window.
+      if (hitTrail && close > entryClose) done = true;
+      entryClose = null;
+      peakClose = null;
+      barsSinceExit = 0;
+      return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    }
+    return [];
+  }
+
+  // Flat: no new buy after a profitable trailing exit.
+  if (done) return [];
+  if (barsSinceExit !== null) barsSinceExit += 1;
+
+  // Need a full 240-bar average (and a close 60 bars back) before buying.
+  if (closes.length < WARMUP_BARS) return [];
+  const n = closes.length;
+  const sum240 = sma240();
+
+  // After an exit, the 240-bar wait plus a close back above the average.
+  if (barsSinceExit !== null) {
+    if (barsSinceExit < COOLDOWN_BARS) return [];
+    if (close * BigInt(WARMUP_BARS) <= sum240) return [];
+  }
+
+  // Dip: at least 0.6% below the 240-bar average.
+  const belowAverage = close * BigInt(WARMUP_BARS) * 1000n <= sum240 * DIP_BPS;
+  // Weakness: at least 0.4% below the close 60 bars ago.
+  const close60Ago = closes[n - 1 - LOOKBACK_BARS]!;
+  const belowThen = close * 1000n <= close60Ago * MOMENTUM_BPS;
+  // V-confirm: this close is the highest of the last 3 closes.
+  const vConfirm = close >= closes[n - 2]! && close >= closes[n - 3]!;
+
+  if (!belowAverage || !belowThen || !vConfirm) return [];
+  if (state.cash <= 0n) return [];
+
+  entryClose = close;
+  peakClose = close;
+  awaitingFill = true;
+  return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+}
+
+await runBars({ onBatch });

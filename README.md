@@ -1,30 +1,49 @@
-# btc-race-24h-20261123-0511-entry
+# btc-race-24h-20261123-0511 — dip-buy bot
 
-[![make.fun · btc-race-24h-20261123-0511](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
-[![rank](https://make.fun/badge/btc-race-24h-20261123-0511/Richat1801/btc-race-24h-20261123-0511-entry/rank.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
-[![reward](https://make.fun/badge/btc-race-24h-20261123-0511/Richat1801/btc-race-24h-20261123-0511-entry/reward.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
+[![btc-race-24h-20261123-0511](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
+[![Rank](https://make.fun/badge/rank/Richat1801/btc-race-24h-20261123-0511-entry.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
+[![Reward](https://make.fun/badge/reward/Richat1801/btc-race-24h-20261123-0511-entry.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
 
-# Dip-Buy cbBTC Bot
-
-Entry for [btc-race-24h-20261123-0511](https://make.fun/bounty/btc-race-24h-20261123-0511) — a bot that trades Coinbase Wrapped BTC (cbBTC) on 1-minute on-chain prices with $1,000 of paper money.
+A deterministic, long-only dip-buy bot for Coinbase Wrapped BTC (cbBTC)
+against USDC, built for the make.fun competition
+[btc-race-24h-20261123-0511](https://make.fun/bounty/btc-race-24h-20261123-0511).
+It trades 1-minute on-chain bars with $1,000 of paper money — nothing is
+traded for real.
 
 ## Strategy
 
-Buy the whole stake only on a confirmed V-dip, then exit on a hard stop or a tight trailing stop. One position at a time, long only, fully deterministic.
+Buy a dip only once it has stopped falling, then exit on a hard stop or a
+trailing stop:
 
-- **Buy** (after a 240-bar warm-up): close ≥ 0.6% below its 240-bar average, ≥ 0.4% below the close 60 minutes ago, and at/above the highest close of the last 3 bars (the fall has stopped and turned).
-- **Sell**: hard stop 1.0% below entry, or trailing stop 0.8% below the peak once the peak is ≥ 0.5% above entry.
-- After any exit: 240-bar cooldown plus the price must trade back above its 240-bar average before re-arming. A profitable trailing exit ends trading for the window.
+- Warm up for 240 bars before the first buy.
+- **Buy** (full cash, one position at a time) when the close is at least
+  0.6% below its 240-bar average, at least 0.4% below the close 60 bars
+  ago, and is the highest close of the last 3 bars (the fall has turned).
+- **Sell all** on a hard stop 1.0% below the entry close, or on a trailing
+  stop: once the close has peaked at least 0.5% above entry, sell when it
+  falls 0.8% below that peak.
+- After any exit, wait 240 bars and require the close to trade back above
+  its 240-bar average before the next buy.
+- A profitable trailing exit ends trading for the rest of the window.
 
-## Dev result
+All comparisons are exact bigint arithmetic — no floats, no clock, no
+randomness, no network, no environment reads — so two runs produce the
+same orders byte for byte.
 
-Python-simulated on the frozen 24 h dev window: about +$9.0 net PnL on 2 trades, max drawdown under 1% (dev gate: net PnL > $0). The window itself is up +3.64%; buy-and-hold would make ~+$36 there but loses ~-$35 on the time-reversed window, where this bot stays positive (+$1.1).
+## Layout
 
-## Files
+- `main.ts` — the bot (Node 22, stdlib only, speaks
+  `agent-fun/bars-replay/v1` via the vendored SDK shim).
+- `vendor/makefun-bars.ts` — byte copy of the kit's SDK shim.
+- `.makefun/owner.json` — claim file naming the entrant's wallet.
 
-- `main.ts` — the bot (Node 22, standard library only)
-- `vendor/makefun-bars.ts` — the kit's bars-replay SDK, vendored byte-identical
+## Local grade
 
-## License
+From the kit directory:
 
-MIT
+```sh
+node cli/makefun.mjs grade-local --kit . --bot <this repo> --driver process --worktree
+```
+
+Dev window (frozen 24 h, 1,440 bars): net PnL about +$7 to +$9, 2 trades,
+max drawdown about 1%, guardrails met.
